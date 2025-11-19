@@ -4,9 +4,11 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(express.json());
 
-const https://hooks.zapier.com/hooks/catch/122973/uzuhqhs/ = process.env.https://hooks.zapier.com/hooks/catch/122973/uzuhqhs/;
+const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
 
 app.post("/vapi-hook", async (req, res) => {
+  console.log("Received request on /vapi-hook");
+
   try {
     const message = req.body?.message;
     if (message?.type === "end-of-call-report") {
@@ -34,6 +36,7 @@ app.post("/vapi-hook", async (req, res) => {
         name,
         ip,
         callId: call.id ?? null,
+        assistantId: call.assistantId ?? null,
         endedReason: message.endedReason ?? null,
         startedAt: call.startedAt ?? null,
         endedAt: call.endedAt ?? null,
