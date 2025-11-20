@@ -1,102 +1,69 @@
-const express = require("express");
-const fetch = require("node-fetch");
+import express from "express";
+import fetch from "node-fetch";
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
 
+dotenv.config();
 const app = express();
-app.use(express.json());
 
-const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
+app.use(bodyParser.json());
 
-// Helper to safely dig into nested properties
-const get = (obj, path, fallback = null) =>
-  path.split(".").reduce((acc, key) => (acc && acc[key] !== undefined ? acc[key] : null), obj) ?? fallback;
+// Zapier webhook URL stored as an environment variable in Render
+const ZAPIER_WEBHOOK = process.env.ZAPIER_WEBHOOK_URL;
 
-app.post("/vapi-hook", async (req, res) => {
-  console.log("===== Incoming /vapi-hook request =====");
-  console.log("Body:", JSON.stringify(req.body, null, 2));
-  console.log("=======================================");
+app.post("/", async (req, res) => {
+  console.log("🔔 Incoming event from Vapi");
 
   try {
-    const message = req.body?.message;
-    if (message?.type !== "end-of-call-report") {
-      // Ignore anything else, just in case
-      return res.status(200).send("ignored");
-    }
+    const data = req.body || {};
+    const payload = data.payload || {};
 
-    // Phone number – use best available source
-    const phone =
-      get(message, "customer.number") ||
-      get(message, "variables.customer.number") ||
-      get(message, "variableValues.customer.number") ||
-      get(message, "call.customer.number") ||
-      null;
+    // Extract useful fields safely
+    const cleaned = {
+      callId: payload.call?.id ?? null,
+      assistantId: payload.assistantId ?? null,
 
-    // Name – not in your payload yet, but this is where we’d look
-    const name =
-      get(message, "customer.name") ||
-      get(message, "variables.customer.name") ||
-      get(message, "variableValues.customer.name") ||
-      null;
+      // Caller info
+      phoneNumber: payload.info?.phoneNumber ?? null,
+      ipAddress: payload.info?.ipAddress ?? null,
 
-    // IP – not present in your payload. If you later pass an IP variable,
-    // for example variables.clientIp, we can pull it from here.
-    const ip =
-      get(message, "variables.clientIp") ||
-      get(message, "variableValues.clientIp") ||
-      null;
+      // Duration + start/end timestamps
+      startTime: payload.startTime ?? null,
+      endTime: payload.endTime ?? null,
+      duration: payload.duration ?? null, // seconds or ms depending on Vapi config
 
-    // Other useful stuff
-    const callId = get(message, "call.id");
-    const assistantId = get(message, "assistant.id");
-    const startedAt = message.startedAt ?? null;
-    const endedAt = message.endedAt ?? null;
-    const endedReason = message.endedReason ?? null;
+      // Call outcome
+      endedReason: payload.endedReason ?? null,
 
-    const summary = get(message, "analysis.summary") ?? null;
-    const transcript = message.transcript ?? null;
-
-    const recordingUrl = message.recordingUrl ?? null;
-    const stereoRecordingUrl = message.stereoRecordingUrl ?? null;
-    const customerRecordingUrl = get(message, "recording.mono.customerUrl");
-    const assistantRecordingUrl = get(message, "recording.mono.assistantUrl");
-
-    const transport = get(message, "variables.transport") || get(message, "variableValues.transport");
-
-    const payload = {
-      phone,
-      name,
-      ip,
-      callId,
-      assistantId,
-      startedAt,
-      endedAt,
-      endedReason,
-      summary,
-      transcript,
-      recordingUrl,
-      stereoRecordingUrl,
-      customerRecordingUrl,
-      assistantRecordingUrl,
-      transport
+      // Analysis
+      successEvaluation: payload.analysis?.successEvaluation ?? null,
+      sentiment: payload.analysis?.sentiment ?? null,
+      topics: payload.analysis?.topics ?? [],
+      summary: payload.analysis?.summary ?? null,
     };
 
-    console.log("Forwarding cleaned payload to Zapier:", JSON.stringify(payload, null, 2));
+    console.log("📦 Cleaned Payload:", cleaned);
 
-    if (ZAPIER_HOOK_URL) {
-      await fetch(ZAPIER_HOOK_URL, {
+    // Forward to Zapier
+    if (ZAPIER_WEBHOOK) {
+      await fetch(ZAPIER_WEBHOOK, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(cleaned),
       });
+
+      console.log("📨 Forwarded cleaned payload to Zapier");
     } else {
-      console.error("Missing ZAPIER_HOOK_URL env variable");
+      console.error("⚠️ ZAPIER_WEBHOOK_URL not set in environment variables");
     }
 
-    res.status(200).send("ok");
-  } catch (e) {
-    console.error("Webhook Error:", e);
-    res.status(200).send("ok"); // still 200 so Vapi doesn’t retry
+    res.status(200).send({ ok: true });
+  } catch (err) {
+    console.error("❌ Error handling Vapi webhook:", err);
+    res.status(500).send({ error: "Error processing webhook" });
   }
 });
 
-const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => console.log(`Middleware running on port ${PORT}`));
+app.listen(10000, () => {
+  console.log("🚀 Middleware running on port 10000");
+});
