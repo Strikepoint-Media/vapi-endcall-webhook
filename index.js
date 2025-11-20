@@ -1,69 +1,82 @@
-import express from "express";
-import fetch from "node-fetch";
-import bodyParser from "body-parser";
-import dotenv from "dotenv";
-
-dotenv.config();
-const app = express();
-
-app.use(bodyParser.json());
-
-// Zapier webhook URL stored as an environment variable in Render
-const ZAPIER_WEBHOOK = process.env.ZAPIER_WEBHOOK_URL;
-
-app.post("/", async (req, res) => {
+app.post("/vapi-hook", async (req, res) => {
   console.log("🔔 Incoming event from Vapi");
 
   try {
-    const data = req.body || {};
-    const payload = data.payload || {};
+    const message = req.body?.message || {};
+    const analysis = message.analysis || {};
 
-    // Extract useful fields safely
+    // Helpful aliases
+    const customer = message.customer || {};
+    const phoneNumberObj = message.phoneNumber || {};
+    const variables = message.variables || {};
+    const transportVars = variables.transport || {};
+    const call = message.call || {};
+    const callTransport = call.transport || {};
+
     const cleaned = {
-      callId: payload.call?.id ?? null,
-      assistantId: payload.assistantId ?? null,
+      // Core identifiers
+      callId: call.id || null,
+      assistantId: message.assistant?.id || null,
 
       // Caller info
-      phoneNumber: payload.info?.phoneNumber ?? null,
-      ipAddress: payload.info?.ipAddress ?? null,
+      phone: customer.number || phoneNumberObj.number || null,
 
-      // Duration + start/end timestamps
-      startTime: payload.startTime ?? null,
-      endTime: payload.endTime ?? null,
-      duration: payload.duration ?? null, // seconds or ms depending on Vapi config
+      // Timing / duration
+      startedAt: message.startedAt || null,
+      endedAt: message.endedAt || null,
+      durationSeconds: message.durationSeconds || null,
+      durationMs: message.durationMs || null,
+      durationMinutes: message.durationMinutes || null,
+      endedReason: message.endedReason || null,
 
-      // Call outcome
-      endedReason: payload.endedReason ?? null,
+      // Recording links
+      recordingUrl: message.recordingUrl || null,
+      stereoRecordingUrl: message.stereoRecordingUrl || null,
 
-      // Analysis
-      successEvaluation: payload.analysis?.successEvaluation ?? null,
-      sentiment: payload.analysis?.sentiment ?? null,
-      topics: payload.analysis?.topics ?? [],
-      summary: payload.analysis?.summary ?? null,
+      // Cost info
+      costTotal: message.cost || null,
+      costBreakdown: message.costBreakdown || null,
+
+      // Analysis / QA fields
+      successEvaluation: analysis.successEvaluation || null,
+      analysisSummary: analysis.summary || null,
+      sentiment: analysis.sentiment || null,
+      topics: analysis.topics || [],
+
+      // Human-readable summary & transcript
+      summary: message.summary || null,
+      transcript: message.transcript || null,
+
+      // Transport / Twilio info (useful for joins)
+      transportProvider:
+        transportVars.provider ||
+        callTransport.provider ||
+        null,
+      callSid:
+        transportVars.callSid ||
+        callTransport.callSid ||
+        null,
+      accountSid:
+        transportVars.accountSid ||
+        callTransport.accountSid ||
+        null,
     };
 
-    console.log("📦 Cleaned Payload:", cleaned);
+    console.log("📦 Forwarding cleaned payload to Zapier:", cleaned);
 
-    // Forward to Zapier
-    if (ZAPIER_WEBHOOK) {
-      await fetch(ZAPIER_WEBHOOK, {
+    if (!ZAPIER_HOOK_URL) {
+      console.error("⚠️ ZAPIER_HOOK_URL env var is not set");
+    } else {
+      await fetch(ZAPIER_HOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(cleaned),
       });
-
-      console.log("📨 Forwarded cleaned payload to Zapier");
-    } else {
-      console.error("⚠️ ZAPIER_WEBHOOK_URL not set in environment variables");
     }
 
-    res.status(200).send({ ok: true });
+    res.status(200).json({ ok: true });
   } catch (err) {
     console.error("❌ Error handling Vapi webhook:", err);
-    res.status(500).send({ error: "Error processing webhook" });
+    res.status(500).json({ error: "Error processing webhook" });
   }
-});
-
-app.listen(10000, () => {
-  console.log("🚀 Middleware running on port 10000");
 });
