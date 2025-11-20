@@ -1,12 +1,17 @@
-// index.js
-import express from 'express';
-import bodyParser from 'body-parser';
-import fetch from 'node-fetch';
+// index.js (CommonJS, works on Render's Node 22)
 
+// ---------- Imports ----------
+const express = require('express');
+const bodyParser = require('body-parser');
+
+// Node 18+ has global fetch
+const fetch = global.fetch;
+
+// ---------- Setup ----------
 const app = express();
 app.use(bodyParser.json());
 
-// ---------- ENV VARS ----------
+// ENV VARS
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
 const ABSTRACT_PHONE_API_KEY = process.env.ABSTRACT_PHONE_API_KEY; // optional
 
@@ -17,9 +22,9 @@ async function enrichPhone(phoneNumber) {
   if (!ABSTRACT_PHONE_API_KEY || !phoneNumber) return null;
 
   try {
-    const url = `https://phonevalidation.abstractapi.com/v1/?api_key=${ABSTRACT_PHONE_API_KEY}&phone=${encodeURIComponent(
-      phoneNumber
-    )}`;
+    const url =
+      `https://phonevalidation.abstractapi.com/v1/?api_key=${ABSTRACT_PHONE_API_KEY}` +
+      `&phone=${encodeURIComponent(phoneNumber)}`;
 
     const res = await fetch(url);
     if (!res.ok) {
@@ -36,6 +41,35 @@ async function enrichPhone(phoneNumber) {
   }
 }
 
+// Decide if we should forward a given Vapi message to Zapier
+function isTerminalEvent(msg) {
+  const type = msg.type;
+
+  if (type === 'end-of-call-report') return true;
+
+  if (type === 'status-update') {
+    const status = (msg.status || '').toLowerCase();
+
+    // Only treat terminal statuses as "one per call" events
+    const terminalStatuses = [
+      'completed',
+      'failed',
+      'no-answer',
+      'busy',
+      'cancelled',
+      'canceled',
+      'voicemail',
+      'customer-ended',
+      'assistant-ended',
+      'ended'
+    ];
+
+    return terminalStatuses.includes(status);
+  }
+
+  return false;
+}
+
 // ---------- Routes ----------
 
 app.get('/', (req, res) => {
@@ -44,77 +78,69 @@ app.get('/', (req, res) => {
 
 app.post('/', async (req, res) => {
   try {
-    // Vapi wraps the payload in { message: { ... } }
-    const msg = req.body?.message || req.body || {};
+    const msg = req.body?.message || {};
+    const eventType = msg.type || 'unknown';
+
+    console.log('Incoming Vapi message:', {
+      type: eventType,
+      status: msg.status,
+      endedReason: msg.endedReason
+    });
+
+    // Ignore noisy intermediate status-update events
+    if (!isTerminalEvent(msg)) {
+      return res.json({ ok: true, ignored: true });
+    }
+
     const artifact = msg.artifact || {};
     const analysis = msg.analysis || {};
     const variables = artifact.variables || msg.variables || {};
 
-    console.log('Incoming Vapi message type:', msg.type);
+    // ----- Core fields -----
 
-    // ----- Customer phone -----
+    // Customer phone number: try several locations
     const customerNumber =
       variables.customer?.number ||
       variables.phoneNumber?.customerNumber ||
       msg.customer?.number ||
-      artifact.customer?.number ||
       null;
 
-    // ----- Call info / timing -----
-    const callObj = msg.call || artifact.call || {};
+    const callObj = msg.call || {};
 
     const callInfo = {
       id: callObj.id || null,
-      type: callObj.type || null,
-      startedAt: msg.startedAt || callObj.startedAt || null,
-      endedAt: msg.endedAt || callObj.endedAt || null,
-      endedReason: msg.endedReason || callObj.endedReason || null,
-      durationSeconds:
-        msg.durationSeconds ??
-        callObj.durationSeconds ??
-        (typeof msg.durationMs === 'number'
-          ? msg.durationMs / 1000
-          : null),
-      durationMinutes:
-        msg.durationMinutes ??
-        callObj.durationMinutes ??
-        (typeof msg.durationMs === 'number'
-          ? msg.durationMs / 60000
-          : null),
-      durationMs: msg.durationMs ?? callObj.durationMs ?? null,
-      cost: msg.cost ?? callObj.cost ?? null,
-      costBreakdown: msg.costBreakdown ?? callObj.costBreakdown ?? null,
+      status: msg.status || msg.endedReason || null,
+      startedAt: msg.startedAt || null,
+      endedAt: msg.endedAt || null,
+      endedReason: msg.endedReason || null,
+      durationSeconds: msg.durationSeconds ?? null,
+      durationMinutes: msg.durationMinutes ?? null,
+      durationMs: msg.durationMs ?? null,
+      cost: msg.cost ?? null,
+      costBreakdown: msg.costBreakdown || null
     };
 
-    // ----- High-level analysis -----
     const analysisInfo = {
       successEvaluation: analysis.successEvaluation ?? null,
-      summary: msg.summary || analysis.summary || null,
-      structuredOutputs: msg.structuredOutputs || artifact.structuredOutputs || null,
-      scorecards: msg.scorecards || artifact.scorecards || null,
+      summary: msg.summary || analysis.summary || null
     };
 
-    // ----- Transcript + recordings -----
     const transcriptInfo = {
       transcript: msg.transcript || artifact.transcript || null,
       recordingUrl: msg.recordingUrl || artifact.recordingUrl || null,
       stereoRecordingUrl:
         msg.stereoRecordingUrl || artifact.stereoRecordingUrl || null,
-      logUrl: msg.logUrl || artifact.logUrl || null,
+      logUrl: msg.logUrl || artifact.logUrl || null
     };
 
-    // ----- Transport (Twilio / etc.) -----
     const transport =
-      variables.transport ||
-      msg.transport ||
-      callObj.transport ||
-      {};
+      variables.transport || msg.transport || callObj.transport || {};
 
     const transportInfo = {
       provider: transport.provider || null,
       conversationType: transport.conversationType || null,
       callSid: transport.callSid || null,
-      accountSid: transport.accountSid || null,
+      accountSid: transport.accountSid || null
     };
 
     // ----- Phone enrichment -----
@@ -122,7 +148,7 @@ app.post('/', async (req, res) => {
 
     const phoneEnrichment = phoneEnrichmentRaw
       ? {
-          raw: phoneEnrichmentRaw, // full payload if you ever want to inspect it
+          raw: phoneEnrichmentRaw, // full payload for debugging
           valid: phoneEnrichmentRaw.valid ?? null,
           international: phoneEnrichmentRaw.format?.international || null,
           local: phoneEnrichmentRaw.format?.local || null,
@@ -131,41 +157,39 @@ app.post('/', async (req, res) => {
           countryPrefix: phoneEnrichmentRaw.country?.prefix || null,
           location: phoneEnrichmentRaw.location || null, // often state / region
           carrier: phoneEnrichmentRaw.carrier || null,
-          lineType: phoneEnrichmentRaw.type || null, // mobile / landline / voip
+          lineType: phoneEnrichmentRaw.type || null // mobile / landline / voip
         }
       : null;
 
     // ----- Payload we send to Zapier -----
     const outgoingPayload = {
-      // What type of Vapi server message this is (end-of-call-report, etc.)
-      eventType: msg.type || null,
-
+      eventType,
       call: callInfo,
       analysis: analysisInfo,
       transcript: transcriptInfo,
-
       customer: {
-        number: customerNumber,
+        number: customerNumber
       },
-
       transport: transportInfo,
-      phoneEnrichment,
+      phoneEnrichment
+      // If you ever want the whole blob:
+      // originalMessage: msg,
     };
 
     console.log('Forwarding cleaned payload to Zapier:', {
-      eventType: outgoingPayload.eventType,
+      eventType,
+      status: callInfo.status,
+      successEvaluation: analysisInfo.successEvaluation,
+      durationSeconds: callInfo.durationSeconds,
       customer: outgoingPayload.customer,
-      durationSeconds: outgoingPayload.call.durationSeconds,
-      endedReason: outgoingPayload.call.endedReason,
-      successEvaluation: outgoingPayload.analysis.successEvaluation,
-      enrichmentSummary: phoneEnrichment
+      phoneEnrichment: phoneEnrichment
         ? {
             valid: phoneEnrichment.valid,
             countryName: phoneEnrichment.countryName,
             location: phoneEnrichment.location,
-            carrier: phoneEnrichment.carrier,
+            carrier: phoneEnrichment.carrier
           }
-        : null,
+        : null
     });
 
     if (!ZAPIER_HOOK_URL) {
@@ -175,11 +199,10 @@ app.post('/', async (req, res) => {
         .json({ error: 'ZAPIER_HOOK_URL is not configured' });
     }
 
-    // ----- Send to Zapier -----
     const zapRes = await fetch(ZAPIER_HOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(outgoingPayload),
+      body: JSON.stringify(outgoingPayload)
     });
 
     if (!zapRes.ok) {
@@ -187,7 +210,6 @@ app.post('/', async (req, res) => {
       console.error('Error forwarding to Zapier:', zapRes.status, text);
     }
 
-    // Always tell Vapi we handled it
     res.json({ ok: true });
   } catch (err) {
     console.error('Webhook handler error:', err);
@@ -196,7 +218,6 @@ app.post('/', async (req, res) => {
 });
 
 // ---------- Start server ----------
-
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Middleware running on port ${PORT}`);
