@@ -1,5 +1,4 @@
-// index.js (ESM)
-
+// index.js
 import express from 'express';
 import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
@@ -7,106 +6,124 @@ import fetch from 'node-fetch';
 const app = express();
 app.use(bodyParser.json());
 
-// ----------------- ENV VARS -----------------
-
+// ENV VARS
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
-const ABSTRACT_PHONE_API_KEY = process.env.ABSTRACT_PHONE_API_KEY; // optional
+// Use your Abstract *Phone Intelligence* API key here
+const ABSTRACT_PHONE_API_KEY = process.env.ABSTRACT_PHONE_API_KEY; // required for enrichment
 
-// ----------------- Helpers ------------------
+// ---------- Helpers ----------
 
-// Phone enrichment using Abstract Phone Validation API
+// Enrich phone with Abstract Phone Intelligence API
 async function enrichPhone(phoneNumber) {
-  if (!ABSTRACT_PHONE_API_KEY || !phoneNumber) return null;
+  if (!ABSTRACT_PHONE_API_KEY || !phoneNumber) {
+    console.log('Phone enrichment skipped – missing key or phone number');
+    return null;
+  }
 
   try {
-    const url = `https://phonevalidation.abstractapi.com/v1/?api_key=${ABSTRACT_PHONE_API_KEY}&phone=${encodeURIComponent(
-      phoneNumber
-    )}`;
+    const url =
+      `https://phoneintelligence.abstractapi.com/v1/` +
+      `?api_key=${encodeURIComponent(ABSTRACT_PHONE_API_KEY)}` +
+      `&phone=${encodeURIComponent(phoneNumber)}`;
 
     const res = await fetch(url);
+
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      console.error('Phone enrichment HTTP error:', res.status, text);
+      console.error(
+        'Phone enrichment HTTP error:',
+        res.status,
+        text || '(no body)'
+      );
       return null;
     }
 
     const data = await res.json();
-    return data;
+
+    // Defensive mapping – fields may vary, so we check before reading.
+    return {
+      raw: data, // keep full payload for debugging
+
+      // Common fields exposed by Abstract’s phone APIs
+      valid: data.valid ?? null,
+      lineType: data.line_type || data.type || null, // mobile / landline / voip etc.
+      carrier: data.carrier || null,
+      location:
+        data.location ||
+        data.region ||
+        data.city ||
+        null, // usually state / region / city
+      countryName:
+        (data.country && (data.country.name || data.country.country)) || null,
+      countryCode:
+        (data.country && (data.country.code || data.country.iso_code)) || null,
+      countryPrefix: data.country && data.country.prefix
+        ? data.country.prefix
+        : null,
+
+      // Risk / flags if available
+      isPrepaid: data.is_prepaid ?? null,
+      isCommercial: data.is_commercial ?? null,
+      riskLevel: data.risk_level || null,
+    };
   } catch (err) {
     console.error('Phone enrichment error:', err);
     return null;
   }
 }
 
-// ----------------- Routes -------------------
+// ---------- Routes ----------
 
-// Simple health-check
-app.get('/vapi-hook', (req, res) => {
-  res.send('Vapi webhook is running');
+app.get('/', (req, res) => {
+  res.send('Vapi end-of-call webhook is running');
 });
 
-// Main Vapi webhook endpoint
 app.post('/vapi-hook', async (req, res) => {
   try {
-    const outer = req.body || {};
-    const msg = outer.message || {}; // Vapi wraps the actual message
+    const msg = req.body?.message || {};
     const artifact = msg.artifact || {};
     const analysis = msg.analysis || {};
-    const variables =
-      artifact.variables || msg.variables || msg.variableValues || {};
+    const variables = artifact.variables || msg.variables || {};
 
-    const eventType = msg.type || outer.type || null;
-    console.log('Incoming Vapi event type:', eventType);
+    console.log('Incoming Vapi event type:', msg.type);
 
-    // ------------- Core call info -------------
+    // ----- Core fields from Vapi -----
 
-    // Customer phone number
+    // Customer phone number (try a few likely locations)
     const customerNumber =
       variables.customer?.number ||
       variables.phoneNumber?.customerNumber ||
-      outer.customer?.number ||
       msg.customer?.number ||
       null;
 
-    const call = msg.call || outer.call || {};
     const callInfo = {
-      id: call.id || null,
-      type: call.type || null,
-      startedAt: msg.startedAt || outer.startedAt || null,
-      endedAt: msg.endedAt || outer.endedAt || null,
-      endedReason: msg.endedReason || outer.endedReason || null,
-      durationMs: msg.durationMs ?? outer.durationMs ?? null,
-      durationSeconds: msg.durationSeconds ?? outer.durationSeconds ?? null,
-      durationMinutes: msg.durationMinutes ?? outer.durationMinutes ?? null,
-      cost: msg.cost ?? outer.cost ?? null,
+      id: msg.call?.id,
+      startedAt: msg.startedAt || null,
+      endedAt: msg.endedAt || null,
+      endedReason: msg.endedReason || null,
+      durationSeconds: msg.durationSeconds ?? null,
+      durationMinutes: msg.durationMinutes ?? null,
+      durationMs: msg.durationMs ?? null,
+      cost: msg.cost ?? null,
     };
 
-    // ------------- Analysis info -------------
-
     const analysisInfo = {
-      successEvaluation:
-        analysis.successEvaluation ?? msg.successEvaluation ?? null,
+      successEvaluation: analysis.successEvaluation ?? null,
+      score: analysis.score ?? null,
       summary: msg.summary || analysis.summary || null,
     };
 
-    // ------------- Transcript / recordings -------------
-
     const transcriptInfo = {
       transcript: msg.transcript || artifact.transcript || null,
-      recordingUrl:
-        msg.recordingUrl || artifact.recordingUrl || outer.recordingUrl || null,
+      recordingUrl: msg.recordingUrl || artifact.recordingUrl || null,
       stereoRecordingUrl:
-        msg.stereoRecordingUrl ||
-        artifact.stereoRecordingUrl ||
-        outer.stereoRecordingUrl ||
-        null,
-      logUrl: msg.logUrl || artifact.logUrl || outer.logUrl || null,
+        msg.stereoRecordingUrl || artifact.stereoRecordingUrl || null,
+      logUrl: msg.logUrl || artifact.logUrl || null,
     };
 
-    // ------------- Transport (Twilio etc.) -------------
-
     const transport =
-      variables.transport || msg.transport || call.transport || outer.transport || {};
+      variables.transport || msg.transport || msg.call?.transport || {};
+
     const transportInfo = {
       provider: transport.provider || null,
       conversationType: transport.conversationType || null,
@@ -114,39 +131,12 @@ app.post('/vapi-hook', async (req, res) => {
       accountSid: transport.accountSid || null,
     };
 
-    // ------------- Phone enrichment -------------
+    // ----- Phone enrichment via Abstract Phone Intelligence -----
+    const phoneEnrichment = await enrichPhone(customerNumber);
 
-    const phoneEnrichmentRaw = await enrichPhone(customerNumber);
-
-    const phoneEnrichment = phoneEnrichmentRaw
-      ? {
-          raw: phoneEnrichmentRaw, // keep full payload if you want to debug in Zapier
-          valid: phoneEnrichmentRaw.valid ?? null,
-          international: phoneEnrichmentRaw.format?.international || null,
-          local: phoneEnrichmentRaw.format?.local || null,
-          countryName: phoneEnrichmentRaw.country?.name || null,
-          countryCode: phoneEnrichmentRaw.country?.code || null,
-          countryPrefix: phoneEnrichmentRaw.country?.prefix || null,
-          location: phoneEnrichmentRaw.location || null, // often state / region
-          carrier: phoneEnrichmentRaw.carrier || null,
-          lineType: phoneEnrichmentRaw.type || null, // mobile / landline / voip
-        }
-      : null;
-
-    // ------------- Decide what to forward -------------
-
-    // For now: forward BOTH end-of-call-report and status-update
-    // You can filter in Zapier on `eventType`.
-    const shouldForward =
-      eventType === 'end-of-call-report' || eventType === 'status-update';
-
-    if (!shouldForward) {
-      console.log('Ignoring Vapi event type:', eventType);
-      return res.json({ ok: true, ignored: true });
-    }
-
+    // ----- Payload to Zapier -----
     const outgoingPayload = {
-      eventType,
+      eventType: msg.type || null,
       call: callInfo,
       analysis: analysisInfo,
       transcript: transcriptInfo,
@@ -155,20 +145,21 @@ app.post('/vapi-hook', async (req, res) => {
       },
       transport: transportInfo,
       phoneEnrichment,
-      // If you want raw debugging, uncomment this:
-      // originalMessage: outer,
+      // If you ever want to see everything, uncomment the next line:
+      // originalMessage: msg,
     };
 
-    console.log('Forwarding to Zapier:', {
-      eventType,
+    console.log('Forwarding cleaned payload to Zapier:', {
+      eventType: outgoingPayload.eventType,
       call: outgoingPayload.call,
-      successEvaluation: outgoingPayload.analysis.successEvaluation,
       customer: outgoingPayload.customer,
-      phoneSummary: phoneEnrichment
+      phoneEnrichment: phoneEnrichment
         ? {
             valid: phoneEnrichment.valid,
-            location: phoneEnrichment.location,
+            lineType: phoneEnrichment.lineType,
             carrier: phoneEnrichment.carrier,
+            location: phoneEnrichment.location,
+            countryName: phoneEnrichment.countryName,
           }
         : null,
     });
@@ -177,7 +168,7 @@ app.post('/vapi-hook', async (req, res) => {
       console.error('ZAPIER_HOOK_URL is not set');
       return res
         .status(500)
-        .json({ error: 'ZAPIER_HOOK_URL is not configured on the server' });
+        .json({ error: 'ZAPIER_HOOK_URL is not configured' });
     }
 
     const zapRes = await fetch(ZAPIER_HOOK_URL, {
@@ -191,7 +182,6 @@ app.post('/vapi-hook', async (req, res) => {
       console.error('Error forwarding to Zapier:', zapRes.status, text);
     }
 
-    // Always respond to Vapi so it doesn’t retry forever
     res.json({ ok: true });
   } catch (err) {
     console.error('Webhook handler error:', err);
@@ -199,7 +189,7 @@ app.post('/vapi-hook', async (req, res) => {
   }
 });
 
-// ----------------- Start server -----------------
+// ---------- Start server ----------
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
