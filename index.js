@@ -1,53 +1,66 @@
-app.post("/vapi-hook", async (req, res) => {
+import express from "express";
+import fetch from "node-fetch";
+import bodyParser from "body-parser";
+
+const app = express();
+app.use(bodyParser.json());
+
+const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL; // already set in Render
+
+app.post("/", async (req, res) => {
   console.log("🔔 Incoming event from Vapi");
 
   try {
-    const message = req.body?.message || {};
+    const body = req.body || {};
+    const message = body.message || {};
     const analysis = message.analysis || {};
 
-    // Helpful aliases
     const customer = message.customer || {};
     const phoneNumberObj = message.phoneNumber || {};
     const variables = message.variables || {};
     const transportVars = variables.transport || {};
-    const call = message.call || {};
+    const call = body.call || {};              // some call info can be on root
     const callTransport = call.transport || {};
 
+    // Best guess for caller phone
+    const phone =
+      customer.number ||
+      phoneNumberObj.number ||
+      null;
+
     const cleaned = {
-      // Core identifiers
+      // Identifiers
       callId: call.id || null,
       assistantId: message.assistant?.id || null,
 
       // Caller info
-      phone: customer.number || phoneNumberObj.number || null,
+      phone,
 
-      // Timing / duration
-      startedAt: message.startedAt || null,
-      endedAt: message.endedAt || null,
-      durationSeconds: message.durationSeconds || null,
-      durationMs: message.durationMs || null,
-      durationMinutes: message.durationMinutes || null,
-      endedReason: message.endedReason || null,
+      // ✅ Duration & timing (from ROOT of payload)
+      startedAt: body.startedAt || null,
+      endedAt: body.endedAt || null,
+      durationSeconds: body.durationSeconds ?? null,
+      durationMs: body.durationMs ?? null,
+      durationMinutes: body.durationMinutes ?? null,
+      endedReason: body.endedReason || null,
 
       // Recording links
-      recordingUrl: message.recordingUrl || null,
-      stereoRecordingUrl: message.stereoRecordingUrl || null,
+      recordingUrl: body.recordingUrl || null,
+      stereoRecordingUrl: body.stereoRecordingUrl || null,
 
       // Cost info
-      costTotal: message.cost || null,
-      costBreakdown: message.costBreakdown || null,
+      costTotal: body.cost ?? null,
+      costBreakdown: body.costBreakdown ?? null,
 
-      // Analysis / QA fields
-      successEvaluation: analysis.successEvaluation || null,
-      analysisSummary: analysis.summary || null,
-      sentiment: analysis.sentiment || null,
-      topics: analysis.topics || [],
+      // ✅ Analysis
+      successEvaluation: analysis.successEvaluation ?? null,
+      analysisSummary: analysis.summary ?? null,
 
-      // Human-readable summary & transcript
-      summary: message.summary || null,
-      transcript: message.transcript || null,
+      // Human-readable summary/transcript (also on ROOT in your sample)
+      summary: body.summary || null,
+      transcript: body.transcript || null,
 
-      // Transport / Twilio info (useful for joins)
+      // Transport / Twilio info
       transportProvider:
         transportVars.provider ||
         callTransport.provider ||
@@ -79,4 +92,8 @@ app.post("/vapi-hook", async (req, res) => {
     console.error("❌ Error handling Vapi webhook:", err);
     res.status(500).json({ error: "Error processing webhook" });
   }
+});
+
+app.listen(10000, () => {
+  console.log("🚀 Middleware running on port 10000");
 });
