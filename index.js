@@ -1,192 +1,161 @@
 // index.js
-import express from 'express';
-import bodyParser from 'body-parser';
-import fetch from 'node-fetch';
+import express from "express";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(bodyParser.json());
 
-// ---------- Env vars ----------
-const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
-const ABSTRACT_PHONE_API_KEY = process.env.ABSTRACT_PHONE_API_KEY;
+// ----- ENV VARS -----
+const { ZAPIER_HOOK_URL, ABSTRACT_PHONE_API_KEY } = process.env;
 
-// ---------- Helpers ----------
-
-// Call Abstract Phone Intelligence API
+// -------------------------------------------
+// Phone enrichment via Abstract Phone Intelligence API
+// -------------------------------------------
 async function enrichPhone(phoneNumber) {
-  if (!ABSTRACT_PHONE_API_KEY || !phoneNumber) {
-    console.log('Phone enrichment skipped: missing API key or phone number');
-    return null;
-  }
+  if (!ABSTRACT_PHONE_API_KEY || !phoneNumber) return null;
 
   try {
-    const url = `https://phoneintelligence.abstractapi.com/v1/?api_key=${encodeURIComponent(
-      ABSTRACT_PHONE_API_KEY
-    )}&phone=${encodeURIComponent(phoneNumber)}`;
+    const url = `https://phoneintelligence.abstractapi.com/v1/?api_key=${ABSTRACT_PHONE_API_KEY}&phone=${encodeURIComponent(
+      phoneNumber
+    )}`;
 
     const res = await fetch(url);
-    const text = await res.text();
-
     if (!res.ok) {
-      console.error('Phone enrichment HTTP error:', res.status, text);
+      const text = await res.text().catch(() => "");
+      console.error("Phone enrichment HTTP error:", res.status, text);
       return null;
     }
 
-    const data = JSON.parse(text);
-    console.log('Raw phone enrichment response:', data);
+    const data = await res.json();
     return data;
   } catch (err) {
-    console.error('Phone enrichment error:', err);
+    console.error("Phone enrichment error:", err);
     return null;
   }
 }
 
-// Map Abstract Phone Intelligence response into a compact object
-function buildPhoneEnrichment(phoneEnrichmentRaw) {
-  if (!phoneEnrichmentRaw || phoneEnrichmentRaw.error) return null;
+// -------------------------------------------
+// Identity & Contact Validation score (0–70)
+// based on descriptive outcome + duration
+// -------------------------------------------
+function getIdentityScore(descriptiveOutcome, durationSeconds) {
+  if (!descriptiveOutcome) return 0;
 
-  const v = phoneEnrichmentRaw.phone_validation || {};
-  const c = phoneEnrichmentRaw.phone_carrier || {};
-  const loc = phoneEnrichmentRaw.phone_location || {};
-  const fmt = phoneEnrichmentRaw.phone_format || {};
-  const msg = phoneEnrichmentRaw.phone_messaging || {};
-  const risk = phoneEnrichmentRaw.phone_risk || {};
+  const label = descriptiveOutcome.toLowerCase();
+  let baseScore;
 
-  return {
-    raw: phoneEnrichmentRaw, // keep full payload if you ever want it in Zapier
+  if (label.includes("invalid") || label.includes("unreachable")) {
+    baseScore = 0;
+  } else if (label.includes("excellent")) {
+    baseScore = 70;
+  } else if (label.includes("good")) {
+    baseScore = 55;
+  } else if (label.includes("fair")) {
+    baseScore = 40;
+  } else if (label.includes("poor")) {
+    baseScore = 15;
+  } else {
+    baseScore = 0;
+  }
 
-    // Validation
-    valid: typeof v.is_valid === 'boolean' ? v.is_valid : null,
-    lineStatus: v.line_status || null,
-    isVoip: typeof v.is_voip === 'boolean' ? v.is_voip : null,
+  // If the call was short, cap "excellent" style scores
+  if (durationSeconds != null && durationSeconds < 30 && baseScore > 50) {
+    baseScore = 50;
+  }
 
-    // Carrier
-    carrier: c.name || null,
-    lineType: c.line_type || null, // mobile / landline / voip / unknown
-    mcc: c.mcc ?? null,
-    mnc: c.mnc ?? null,
-
-    // Location
-    location: loc.region || loc.city || null, // “Anaheim” or “Portland”
-    city: loc.city || null,
-    region: loc.region || null,
-    countryName: loc.country_name || null,
-    countryCode: loc.country_code || null,
-    countryPrefix: loc.country_prefix || null,
-    timezone: loc.timezone || null,
-
-    // Formatting
-    international: fmt.international || null,
-    national: fmt.national || null,
-
-    // Messaging
-    smsDomain: msg.sms_domain || null,
-    smsEmail: msg.sms_email || null,
-
-    // Risk
-    riskLevel: risk.risk_level || null,
-    isDisposable:
-      typeof risk.is_disposable === 'boolean' ? risk.is_disposable : null,
-    isAbuseDetected:
-      typeof risk.is_abuse_detected === 'boolean'
-        ? risk.is_abuse_detected
-        : null,
-  };
+  return baseScore;
 }
 
-// Helper to get duration in seconds from various shapes
-function getDurationSeconds(callObj, msg) {
-  if (callObj && callObj.durationSeconds != null) return callObj.durationSeconds;
-  if (msg && msg.durationSeconds != null) return msg.durationSeconds;
-  return null;
+// -------------------------------------------
+// Decide if this Vapi event should be forwarded
+// -------------------------------------------
+function shouldForward(msg) {
+  const type = msg.type;
+  const endedReason = msg.endedReason || msg.call?.endedReason || null;
+
+  // Always take full end-of-call reports
+  if (type === "end-of-call-report") return true;
+
+  // For status-updates, only forward when we have an end reason
+  // (covers edge cases where end-of-call-report never arrives)
+  if (type === "status-update") {
+    if (!endedReason) return false;
+    return true;
+  }
+
+  return false;
 }
 
-function getDurationMs(callObj, msg) {
-  if (callObj && callObj.durationMs != null) return callObj.durationMs;
-  if (msg && msg.durationMs != null) return msg.durationMs;
-  return null;
-}
+// -------------------------------------------
+// Routes
+// -------------------------------------------
+app.get("/", (req, res) => {
+  res.send("Vapi end-of-call webhook is running");
+});
 
-// ---------- Main handler ----------
-
-async function handleVapiWebhook(req, res) {
+app.post("/", async (req, res) => {
   try {
-    // Vapi wraps payload in { message: { ... } }
-    const msg = req.body?.message || req.body || {};
+    const msg = req.body?.message || {};
     const artifact = msg.artifact || {};
     const analysis = msg.analysis || {};
     const variables = artifact.variables || msg.variables || {};
-    const callObj = msg.call || msg;
 
-    const eventType = msg.type || null;
-    const callId = callObj.id || msg.callId || msg.id || null;
+    console.log("Incoming Vapi event type:", msg.type);
 
-    console.log('Incoming Vapi event type:', eventType);
-
-    // Figure out timing info
-    const durationSeconds = getDurationSeconds(callObj, msg);
-    const durationMs = getDurationMs(callObj, msg);
-    const endedReason =
-      callObj.endedReason || msg.endedReason || msg.endReason || null;
-
-    // Decide if this is a "final" event we care about:
-    //  - Normal case: end-of-call-report
-    //  - Edge case: very short call that only ever sends a status-update with an endedReason
-    const isEndReport = eventType === 'end-of-call-report';
-    const isEarlyTerminalStatus =
-      eventType === 'status-update' &&
-      !!endedReason &&
-      durationSeconds == null &&
-      durationMs == null;
-
-    if (!isEndReport && !isEarlyTerminalStatus) {
-      console.log('Non-final event, skipping send to Zapier:', {
-        eventType,
-        callId,
-        endedReason,
-        durationSeconds,
-        durationMs,
-      });
-      return res.json({ ok: true, skipped: true });
+    if (!shouldForward(msg)) {
+      return res.json({ ok: true, forwarded: false });
     }
 
-    // ----- Core fields from Vapi -----
+    // ----- Core call + customer info -----
+    const call = msg.call || {};
 
-    // Customer phone number: look in variables, customer, call, etc.
     const customerNumber =
       variables.customer?.number ||
       variables.phoneNumber?.customerNumber ||
       msg.customer?.number ||
-      callObj.customerNumber ||
       null;
 
-    // Call info
+    const durationSeconds =
+      msg.durationSeconds ?? call.durationSeconds ?? null;
+
     const callInfo = {
-      id: callId,
-      startedAt: callObj.startedAt || msg.startedAt || null,
-      endedAt: callObj.endedAt || msg.endedAt || null,
-      endedReason,
+      id: call.id || msg.callId || null,
+      startedAt: msg.startedAt || call.startedAt || null,
+      endedAt: msg.endedAt || call.endedAt || null,
+      endedReason: msg.endedReason || call.endedReason || null,
       durationSeconds,
-      durationMinutes:
-        durationSeconds != null
-          ? Number((durationSeconds / 60).toFixed(3))
-          : callObj.durationMinutes ??
-            msg.durationMinutes ??
-            null,
-      durationMs,
-      cost: callObj.cost ?? msg.cost ?? 0,
+      durationMinutes: msg.durationMinutes ?? call.durationMinutes ?? null,
+      durationMs: msg.durationMs ?? call.durationMs ?? null,
+      cost: msg.cost ?? call.cost ?? 0,
     };
 
-    // High-level analysis
+    // ----- Analysis: success eval + structured output -----
+    const successEvaluation = analysis.successEvaluation ?? null;
+
+    const structured =
+      analysis.structuredOutputs || msg.structuredOutputs || {};
+
+    // Try multiple key styles in case Vapi slugs the name
+    const descriptiveOutcome =
+      structured["Success Evaluation - Descriptive"] ||
+      structured.successEvaluationDescriptive ||
+      structured.success_evaluation_descriptive ||
+      null;
+
+    const identityValidationScore = getIdentityScore(
+      descriptiveOutcome,
+      durationSeconds
+    );
+
     const analysisInfo = {
-      successEvaluation:
-        analysis.successEvaluation ??
-        msg.successEvaluation ??
-        null,
+      successEvaluation, // whatever Vapi returns here (pass/fail/etc.)
+      descriptiveOutcome, // Excellent / Good / Fair / Poor / Invalid / Unreachable
+      identityValidationScore, // 0–70
       summary: msg.summary || analysis.summary || null,
     };
 
-    // Transcript / recordings
+    // ----- Transcript + recordings -----
     const transcriptInfo = {
       transcript: msg.transcript || artifact.transcript || null,
       recordingUrl: msg.recordingUrl || artifact.recordingUrl || null,
@@ -195,9 +164,9 @@ async function handleVapiWebhook(req, res) {
       logUrl: msg.logUrl || artifact.logUrl || null,
     };
 
-    // Transport (Twilio etc.)
+    // ----- Transport (Twilio etc.) -----
     const transport =
-      variables.transport || msg.transport || callObj.transport || {};
+      variables.transport || msg.transport || call.transport || {};
 
     const transportInfo = {
       provider: transport.provider || null,
@@ -208,11 +177,22 @@ async function handleVapiWebhook(req, res) {
 
     // ----- Phone enrichment -----
     const phoneEnrichmentRaw = await enrichPhone(customerNumber);
-    const phoneEnrichment = buildPhoneEnrichment(phoneEnrichmentRaw);
 
-    // ----- Payload we send to Zapier -----
+    const phoneEnrichment = phoneEnrichmentRaw
+      ? {
+          raw: phoneEnrichmentRaw,
+          valid: phoneEnrichmentRaw.phone_validation?.is_valid ?? null,
+          lineType: phoneEnrichmentRaw.phone_carrier?.line_type || null,
+          carrier: phoneEnrichmentRaw.phone_carrier?.name || null,
+          location: phoneEnrichmentRaw.phone_location?.region || null,
+          city: phoneEnrichmentRaw.phone_location?.city || null,
+          countryName: phoneEnrichmentRaw.phone_location?.country_name || null,
+        }
+      : null;
+
+    // ----- Final payload to Zapier -----
     const outgoingPayload = {
-      eventType,
+      eventType: msg.type || null,
       call: callInfo,
       analysis: analysisInfo,
       transcript: transcriptInfo,
@@ -221,62 +201,47 @@ async function handleVapiWebhook(req, res) {
       },
       transport: transportInfo,
       phoneEnrichment,
-      // Uncomment this if you ever want the full Vapi message in Zapier:
-      // originalMessage: msg,
     };
 
-    console.log('Forwarding cleaned payload to Zapier:', {
+    console.log("Forwarding cleaned payload to Zapier:", {
       eventType: outgoingPayload.eventType,
       call: outgoingPayload.call,
+      analysis: {
+        descriptiveOutcome: outgoingPayload.analysis.descriptiveOutcome,
+        identityValidationScore:
+          outgoingPayload.analysis.identityValidationScore,
+      },
       customer: outgoingPayload.customer,
-      phoneEnrichment: phoneEnrichment
-        ? {
-            valid: phoneEnrichment.valid,
-            lineType: phoneEnrichment.lineType,
-            carrier: phoneEnrichment.carrier,
-            location: phoneEnrichment.location,
-            countryName: phoneEnrichment.countryName,
-          }
-        : null,
     });
 
     if (!ZAPIER_HOOK_URL) {
-      console.error('ZAPIER_HOOK_URL is not set');
+      console.error("ZAPIER_HOOK_URL is not set");
       return res
         .status(500)
-        .json({ error: 'ZAPIER_HOOK_URL is not configured' });
+        .json({ error: "ZAPIER_HOOK_URL is not configured" });
     }
 
     const zapRes = await fetch(ZAPIER_HOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(outgoingPayload),
     });
 
     if (!zapRes.ok) {
-      const text = await zapRes.text().catch(() => '');
-      console.error('Error forwarding to Zapier:', zapRes.status, text);
+      const text = await zapRes.text().catch(() => "");
+      console.error("Error forwarding to Zapier:", zapRes.status, text);
     }
 
-    return res.json({ ok: true });
+    res.json({ ok: true, forwarded: true });
   } catch (err) {
-    console.error('Webhook handler error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error("Webhook handler error:", err);
+    res.status(500).json({ error: "Server error" });
   }
-}
-
-// ---------- Routes ----------
-
-app.get('/', (req, res) => {
-  res.send('Vapi end-of-call webhook is running');
 });
 
-// Support both "/" and "/vapi-hook" for safety
-app.post('/', handleVapiWebhook);
-app.post('/vapi-hook', handleVapiWebhook);
-
-// ---------- Start server ----------
-
+// -------------------------------------------
+// Start server
+// -------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Middleware running on port ${PORT}`);
