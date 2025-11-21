@@ -1,175 +1,146 @@
-// index.js  (ESM-compatible)
-// Node 18+ (Render is on Node 22, so you're good)
+// index.js – Vapi → Zapier webhook
+// CommonJS, works with Render's Node runtime
 
-import express from 'express';
-
-// Read environment variables
-const PORT = process.env.PORT || 10000;
-const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
-const ABSTRACT_PHONE_API_KEY = process.env.ABSTRACT_PHONE_API_KEY;
-
-if (!ZAPIER_HOOK_URL) {
-  console.warn('⚠️ ZAPIER_HOOK_URL is not set. Events will not be forwarded to Zapier.');
-}
-if (!ABSTRACT_PHONE_API_KEY) {
-  console.warn('⚠️ ABSTRACT_PHONE_API_KEY is not set. Phone enrichment will be skipped.');
-}
+const express = require('express');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-/**
- * Helper: call Abstract Phone Intelligence API
- */
-async function enrichPhoneNumber(phoneNumber) {
-  if (!ABSTRACT_PHONE_API_KEY || !phoneNumber) return null;
+// Env vars from Render
+const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
 
-  try {
-    const url = `https://phoneintelligence.abstractapi.com/v1/?api_key=${encodeURIComponent(
-      ABSTRACT_PHONE_API_KEY
-    )}&phone=${encodeURIComponent(phoneNumber)}`;
-
-    const response = await fetch(url);
-    if (!response.ok) {
-      const text = await response.text();
-      console.error('❌ Phone enrichment HTTP error:', response.status, text);
-      return null;
-    }
-
-    const data = await response.json();
-
-    // Log raw response for debugging
-    console.log('Raw phone enrichment response:', data);
-
-    return {
-      valid: data.phone_validation?.is_valid ?? null,
-      lineType: data.phone_carrier?.line_type ?? null,
-      carrier: data.phone_carrier?.name ?? null,
-      location: data.phone_location?.city ?? null,
-      region: data.phone_location?.region ?? null,
-      countryName: data.phone_location?.country_name ?? null,
-      timezone: data.phone_location?.timezone ?? null,
-    };
-  } catch (err) {
-    console.error('❌ Error calling phone enrichment API:', err);
-    return null;
-  }
+if (!ZAPIER_HOOK_URL) {
+  console.warn('⚠️ ZAPIER_HOOK_URL is not set in environment variables');
 }
 
-/**
- * Helper: forward cleaned payload to Zapier
- */
-async function forwardToZapier(payload) {
-  if (!ZAPIER_HOOK_URL) {
-    console.warn('⚠️ ZAPIER_HOOK_URL not configured. Skipping Zapier forward.');
-    return;
-  }
-
-  try {
-    console.log('Forwarding cleaned payload to Zapier:', payload);
-
-    const res = await fetch(ZAPIER_HOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.error('❌ Zapier HTTP error:', res.status, text);
-    }
-  } catch (err) {
-    console.error('❌ Error forwarding to Zapier:', err);
-  }
-}
+// Simple healthcheck
+app.get('/', (req, res) => {
+  res.status(200).send('Vapi end-of-call webhook is live');
+});
 
 /**
- * Main webhook endpoint for Vapi
+ * Helper: normalize Vapi event into the shape we send to Zapier
  */
-app.post('/vapi-hook', async (req, res) => {
-  const event = req.body || {};
-  console.log('Incoming Vapi event:', JSON.stringify(event, null, 2));
+function buildCleanPayload(raw) {
+  const rawType =
+    raw.type ||
+    raw.eventType ||
+    raw.event_type ||
+    null;
 
-  // Vapi usually uses "type" for the event name
-  const eventType = event.type || event.eventType || 'unknown';
-
-  const call = event.call || {};
-  const customer = event.customer || {};
-  const analysis = event.analysis || {};
+  const call = raw.call || {};
+  const customer = raw.customer || {};
+  const analysis = raw.analysis || {};
   const structuredOutputs =
-    event.structuredOutputs || event.structured_outputs || null;
+    raw.structuredOutputs ||
+    raw.structured_outputs ||
+    null;
 
-  const phoneNumber =
-    customer.number || customer.phoneNumber || customer.phone || null;
+  return {
+    eventType: rawType || 'unknown',
 
-  // Always attempt enrichment if possible
-  let phoneEnrichment = event.phoneEnrichment || event.phone_enrichment || null;
-  if (!phoneEnrichment && phoneNumber) {
-    phoneEnrichment = await enrichPhoneNumber(phoneNumber);
-  }
-
-  // Normalize call timing data
-  const durationMs = call.durationMs ?? null;
-  const durationSeconds =
-    call.durationSeconds ??
-    (typeof durationMs === 'number' ? durationMs / 1000 : null);
-  const durationMinutes =
-    call.durationMinutes ??
-    (typeof durationMs === 'number'
-      ? Number((durationMs / 60000).toFixed(3))
-      : null);
-
-  const cleanedPayload = {
-    eventType, // e.g. "status-update", "end-of-call-report"
     call: {
       id: call.id ?? null,
       startedAt: call.startedAt ?? null,
       endedAt: call.endedAt ?? null,
-      endedReason: call.endedReason ?? call.ended_reason ?? null,
-      durationSeconds,
-      durationMinutes,
-      durationMs,
-      cost: call.cost ?? null,
+      endedReason: call.endedReason ?? null,
+      durationSeconds: call.durationSeconds ?? null,
+      durationMinutes: call.durationMinutes ?? null,
+      durationMs: call.durationMs ?? null,
+      cost: call.cost ?? null
     },
+
     customer: {
-      number: phoneNumber,
+      number: customer.number ?? null,
       name: customer.name ?? null,
-      metadata: customer.metadata ?? null,
+      metadata: customer.metadata ?? null
     },
-    phoneEnrichment: phoneEnrichment || {
+
+    phoneEnrichment: raw.phoneEnrichment || {
       valid: null,
       lineType: null,
       carrier: null,
       location: null,
-      region: null,
-      countryName: null,
-      timezone: null,
+      countryName: null
     },
+
     analysis: {
-      // These come from Vapi’s Summary + Success Evaluation / Rubric
       summary: analysis.summary ?? null,
       successEvaluation: analysis.successEvaluation ?? null,
-      score: analysis.score ?? null,
+      score: analysis.score ?? null
     },
-    structuredOutputs, // full blob of any structured outputs you configured
-    rawEventType: event.type || null, // keep original for debugging
+
+    structuredOutputs: structuredOutputs ?? null,
+    rawEventType: rawType ?? null
   };
-
-  // Forward everything to Zapier
-  await forwardToZapier(cleanedPayload);
-
-  // Respond to Vapi
-  res.status(200).json({ ok: true });
-});
+}
 
 /**
- * Health check / root
+ * Main Vapi webhook endpoint
  */
-app.get('/', (_req, res) => {
-  res.status(200).send('Vapi end-of-call webhook is running.');
+app.post('/vapi-hook', async (req, res) => {
+  const raw = req.body || {};
+
+  console.log('Incoming raw Vapi event:', JSON.stringify(raw, null, 2));
+
+  const vapiType =
+    raw.type ||
+    raw.eventType ||
+    raw.event_type ||
+    null;
+
+  // Only process real call lifecycle events
+  const isStatusUpdate = vapiType === 'status-update';
+  const isEndOfCall = vapiType === 'end-of-call-report';
+
+  if (!isStatusUpdate && !isEndOfCall) {
+    console.log(
+      `Ignoring non-call event type: ${vapiType || 'unknown'} (no data forwarded to Zapier)`
+    );
+    return res.status(200).send('ignored');
+  }
+
+  // For status-update we only care once the call has an end reason
+  if (isStatusUpdate) {
+    const call = raw.call || {};
+    if (!call.endedReason) {
+      console.log(
+        'Status-update without endedReason – mid-call update. Not forwarding to Zapier yet.'
+      );
+      return res.status(200).send('ignored');
+    }
+  }
+
+  const cleanedPayload = buildCleanPayload(raw);
+
+  console.log(
+    'Forwarding cleaned payload to Zapier:',
+    JSON.stringify(cleanedPayload, null, 2)
+  );
+
+  try {
+    if (!ZAPIER_HOOK_URL) {
+      console.error('❌ No ZAPIER_HOOK_URL set, cannot forward to Zapier');
+    } else {
+      await axios.post(ZAPIER_HOOK_URL, cleanedPayload, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    res.status(200).send('ok');
+  } catch (err) {
+    console.error('Error forwarding to Zapier:', err.message);
+    if (err.response) {
+      console.error('Zapier response data:', err.response.data);
+      console.error('Zapier status:', err.response.status);
+    }
+    res.status(500).send('error');
+  }
 });
 
+// Start server
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Middleware server running on port ${PORT}`);
-  console.log('=> Your service is live 🎉');
+  console.log(`Webhook server listening on port ${PORT}`);
 });
