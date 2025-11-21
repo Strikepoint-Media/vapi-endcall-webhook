@@ -1,44 +1,39 @@
-// index.js – Vapi → Zapier webhook
-// CommonJS, works with Render's Node runtime
+// index.js  (ESM compatible)
 
-const express = require('express');
-const axios = require('axios');
+import express from "express";
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+const PORT = process.env.PORT || 10000;
 
-// Env vars from Render
+// Environment variables on Render
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
 
-if (!ZAPIER_HOOK_URL) {
-  console.warn('⚠️ ZAPIER_HOOK_URL is not set in environment variables');
-}
+app.use(express.json());
 
-// Simple healthcheck
-app.get('/', (req, res) => {
-  res.status(200).send('Vapi end-of-call webhook is live');
-});
-
-/**
- * Helper: normalize Vapi event into the shape we send to Zapier
- */
-function buildCleanPayload(raw) {
+// ---- Helper: map incoming Vapi event into a clean payload ----
+function mapVapiEvent(body) {
+  // Vapi usually sends `type`, but fall back just in case
   const rawType =
-    raw.type ||
-    raw.eventType ||
-    raw.event_type ||
-    null;
+    body.type || body.eventType || body.event_type || "unknown";
 
-  const call = raw.call || {};
-  const customer = raw.customer || {};
-  const analysis = raw.analysis || {};
-  const structuredOutputs =
-    raw.structuredOutputs ||
-    raw.structured_outputs ||
-    null;
+  const call = body.call || {};
+  const customer = body.customer || body.caller || {};
+
+  const analysis = body.analysis || {};
+  const structuredOutputs = body.structuredOutputs || null;
+
+  // If in future you re-add phone enrichment here, we’ll fill this in.
+  const phoneEnrichmentRaw = body.phoneEnrichment || {};
+  const phoneEnrichment = {
+    valid: phoneEnrichmentRaw.valid ?? null,
+    lineType: phoneEnrichmentRaw.lineType ?? null,
+    carrier: phoneEnrichmentRaw.carrier ?? null,
+    location: phoneEnrichmentRaw.location ?? null,
+    countryName: phoneEnrichmentRaw.countryName ?? null,
+  };
 
   return {
-    eventType: rawType || 'unknown',
+    eventType: rawType,
 
     call: {
       id: call.id ?? null,
@@ -48,99 +43,80 @@ function buildCleanPayload(raw) {
       durationSeconds: call.durationSeconds ?? null,
       durationMinutes: call.durationMinutes ?? null,
       durationMs: call.durationMs ?? null,
-      cost: call.cost ?? null
+      cost: call.cost ?? null,
     },
 
     customer: {
-      number: customer.number ?? null,
+      number:
+        customer.number ||
+        customer.phone ||
+        customer.phoneNumber ||
+        null,
       name: customer.name ?? null,
-      metadata: customer.metadata ?? null
+      metadata: customer.metadata ?? null,
     },
 
-    phoneEnrichment: raw.phoneEnrichment || {
-      valid: null,
-      lineType: null,
-      carrier: null,
-      location: null,
-      countryName: null
-    },
+    phoneEnrichment,
 
     analysis: {
       summary: analysis.summary ?? null,
       successEvaluation: analysis.successEvaluation ?? null,
-      score: analysis.score ?? null
+      score: analysis.score ?? null,
     },
 
-    structuredOutputs: structuredOutputs ?? null,
-    rawEventType: rawType ?? null
+    structuredOutputs,
+
+    // For debugging / filters
+    rawEventType: rawType,
   };
 }
 
-/**
- * Main Vapi webhook endpoint
- */
-app.post('/vapi-hook', async (req, res) => {
-  const raw = req.body || {};
-
-  console.log('Incoming raw Vapi event:', JSON.stringify(raw, null, 2));
-
-  const vapiType =
-    raw.type ||
-    raw.eventType ||
-    raw.event_type ||
-    null;
-
-  // Only process real call lifecycle events
-  const isStatusUpdate = vapiType === 'status-update';
-  const isEndOfCall = vapiType === 'end-of-call-report';
-
-  if (!isStatusUpdate && !isEndOfCall) {
-    console.log(
-      `Ignoring non-call event type: ${vapiType || 'unknown'} (no data forwarded to Zapier)`
-    );
-    return res.status(200).send('ignored');
-  }
-
-  // For status-update we only care once the call has an end reason
-  if (isStatusUpdate) {
-    const call = raw.call || {};
-    if (!call.endedReason) {
-      console.log(
-        'Status-update without endedReason – mid-call update. Not forwarding to Zapier yet.'
-      );
-      return res.status(200).send('ignored');
-    }
-  }
-
-  const cleanedPayload = buildCleanPayload(raw);
-
-  console.log(
-    'Forwarding cleaned payload to Zapier:',
-    JSON.stringify(cleanedPayload, null, 2)
-  );
-
+// ---- Main webhook route ----
+app.post("/vapi-hook", async (req, res) => {
   try {
+    console.log("Incoming Vapi event:", JSON.stringify(req.body, null, 2));
+
+    const cleaned = mapVapiEvent(req.body);
+
+    console.log(
+      "Forwarding cleaned payload to Zapier:",
+      JSON.stringify(cleaned, null, 2)
+    );
+
     if (!ZAPIER_HOOK_URL) {
-      console.error('❌ No ZAPIER_HOOK_URL set, cannot forward to Zapier');
+      console.warn(
+        "ZAPIER_HOOK_URL is not set – skipping forward to Zapier."
+      );
     } else {
-      await axios.post(ZAPIER_HOOK_URL, cleanedPayload, {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      try {
+        const zapResp = await fetch(ZAPIER_HOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cleaned),
+        });
+
+        console.log(
+          `Zapier response status: ${zapResp.status} ${zapResp.statusText}`
+        );
+      } catch (err) {
+        console.error("Error forwarding to Zapier:", err);
+      }
     }
 
-    res.status(200).send('ok');
+    // Always acknowledge to Vapi so it doesn’t retry
+    res.status(200).json({ ok: true });
   } catch (err) {
-    console.error('Error forwarding to Zapier:', err.message);
-    if (err.response) {
-      console.error('Zapier response data:', err.response.data);
-      console.error('Zapier status:', err.response.status);
-    }
-    res.status(500).send('error');
+    console.error("Error in /vapi-hook handler:", err);
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
+// Simple health check
+app.get("/", (req, res) => {
+  res.send("Vapi end-call webhook is running.");
+});
+
 // Start server
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Webhook server listening on port ${PORT}`);
+  console.log(`Middleware server running on port ${PORT}`);
 });
