@@ -1,6 +1,7 @@
 // index.js  (ESM)
 
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -32,7 +33,7 @@ function mapVapiEvent(body) {
     msg.structuredOutputs || msg.artifact?.structuredOutputs;
   const scorecards = msg.scorecards;
 
-  // Build objects ONLY with existing values so JSON has no explicit nulls
+  // Build objects ONLY with existing values
 
   const call = {};
   if (callObj.id) call.id = callObj.id;
@@ -98,7 +99,7 @@ function mapVapiEvent(body) {
 
 /**
  * Enrich a phone number using Abstract's Phone Validation API.
- * Returns an object with only real values, or undefined if nothing usable.
+ * Returns an object with only real values, or undefined if it fails.
  */
 async function enrichPhone(phoneNumber) {
   try {
@@ -116,17 +117,22 @@ async function enrichPhone(phoneNumber) {
       phoneNumber
     )}`;
 
+    console.log("Calling Abstract API:", url.replace(ABSTRACT_API_KEY, "***"));
+
     const resp = await fetch(url);
+    console.log(
+      "Abstract API response status:",
+      resp.status,
+      resp.statusText
+    );
+
     if (!resp.ok) {
-      console.warn(
-        "Abstract API non-200 response:",
-        resp.status,
-        resp.statusText
-      );
+      console.warn("Abstract API non-200 response body:", await resp.text());
       return;
     }
 
     const data = await resp.json();
+    console.log("Abstract raw response:", JSON.stringify(data, null, 2));
 
     const enrichment = {};
 
@@ -138,9 +144,8 @@ async function enrichPhone(phoneNumber) {
       enrichment.countryName = data.country.name;
     }
 
-    // If nothing got set, don't send an empty object
     if (Object.keys(enrichment).length === 0) {
-      console.warn("Abstract API returned no usable enrichment data:", data);
+      console.warn("Abstract API returned no usable enrichment data.");
       return;
     }
 
@@ -158,9 +163,13 @@ app.post("/vapi-hook", async (req, res) => {
 
     const cleaned = mapVapiEvent(req.body);
 
-    // Enrich phone ONLY if possible; attach ONLY if we get data
+    // Enrich phone and attach the result if we get anything back
     try {
-      const enrichment = await enrichPhone(cleaned.customer?.number);
+      const phoneNumber = cleaned.customer && cleaned.customer.number;
+      console.log("Phone number for enrichment:", phoneNumber);
+
+      const enrichment = await enrichPhone(phoneNumber);
+
       if (enrichment) {
         cleaned.phoneEnrichment = enrichment;
       } else {
@@ -195,6 +204,7 @@ app.post("/vapi-hook", async (req, res) => {
       }
     }
 
+    // Always acknowledge the webhook so Vapi doesn't retry
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Error in /vapi-hook handler:", err);
