@@ -6,9 +6,10 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Set these in Render's environment variables
+// Environment variables (must match Render keys)
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
-const ABSTRACT_API_KEY = process.env.ABSTRACT_API_KEY;
+// IMPORTANT: this now matches your Render env var: ABSTRACT_PHONE_API_KEY
+const ABSTRACT_API_KEY = process.env.ABSTRACT_PHONE_API_KEY;
 
 app.use(express.json());
 
@@ -109,7 +110,9 @@ async function enrichPhone(phoneNumber) {
     }
 
     if (!ABSTRACT_API_KEY) {
-      console.warn("ABSTRACT_API_KEY is not set – skipping phone enrichment.");
+      console.warn(
+        "ABSTRACT_PHONE_API_KEY is not set – skipping phone enrichment."
+      );
       return;
     }
 
@@ -219,4 +222,7 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Middleware server running on port ${PORT}`);
+  console.log(
+    `ABSTRACT_PHONE_API_KEY present: ${!!ABSTRACT_API_KEY}, ZAPIER_HOOK_URL present: ${!!ZAPIER_HOOK_URL}`
+  );
 });
