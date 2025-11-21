@@ -5,8 +5,9 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Set this in Render's environment variables
+// Set these in Render's environment variables
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
+const ABSTRACT_API_KEY = process.env.ABSTRACT_API_KEY;
 
 app.use(express.json());
 
@@ -23,7 +24,7 @@ function mapVapiEvent(body) {
   // Core call object
   const callObj = msg.call || msg.artifact?.call || {};
 
-  // Customer info (also present in variables/variableValues)
+  // Customer info (also potentially present in variables/variableValues)
   const customerObj =
     msg.customer ||
     msg.variables?.customer ||
@@ -65,7 +66,7 @@ function mapVapiEvent(body) {
       metadata: customerObj.metadata ?? null,
     },
 
-    // Placeholder for future phone-enrichment; currently not present in your payload
+    // Default phone enrichment – will be overridden if enrichment succeeds
     phoneEnrichment: {
       valid: null,
       lineType: null,
@@ -100,18 +101,78 @@ function mapVapiEvent(body) {
   };
 }
 
+/**
+ * Enrich a phone number using Abstract's Phone Validation API.
+ * Returns a normalized object that plugs directly into `phoneEnrichment`.
+ */
+async function enrichPhone(phoneNumber) {
+  const emptyResult = {
+    valid: null,
+    lineType: null,
+    carrier: null,
+    location: null,
+    countryName: null,
+  };
+
+  try {
+    if (!phoneNumber) {
+      console.warn("No phone number provided for enrichment.");
+      return emptyResult;
+    }
+
+    if (!ABSTRACT_API_KEY) {
+      console.warn("ABSTRACT_API_KEY is not set – skipping phone enrichment.");
+      return emptyResult;
+    }
+
+    const url = `https://phonevalidation.abstractapi.com/v1/?api_key=${ABSTRACT_API_KEY}&phone=${encodeURIComponent(
+      phoneNumber
+    )}`;
+
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.warn(
+        "Abstract API non-200 response:",
+        resp.status,
+        resp.statusText
+      );
+      return emptyResult;
+    }
+
+    const data = await resp.json();
+
+    // Adjust field names here if your Abstract response is slightly different
+    return {
+      valid: data.valid ?? null,
+      lineType: data.type ?? null,
+      carrier: data.carrier ?? null,
+      location: data.location ?? null,
+      countryName: data.country?.name ?? null,
+    };
+  } catch (err) {
+    console.error("Error enriching phone via Abstract:", err);
+    return emptyResult;
+  }
+}
+
 // ---- Webhook route ----
 app.post("/vapi-hook", async (req, res) => {
   try {
     console.log("Incoming Vapi event:", JSON.stringify(req.body, null, 2));
 
+    // Step 1: Normalize the Vapi payload
     const cleaned = mapVapiEvent(req.body);
+
+    // Step 2: Enrich the phone number using Abstract
+    const enrichment = await enrichPhone(cleaned.customer.number);
+    cleaned.phoneEnrichment = enrichment;
 
     console.log(
       "Forwarding cleaned payload to Zapier:",
       JSON.stringify(cleaned, null, 2)
     );
 
+    // Step 3: Forward to Zapier
     if (!ZAPIER_HOOK_URL) {
       console.warn(
         "ZAPIER_HOOK_URL is not set – skipping forward to Zapier."
