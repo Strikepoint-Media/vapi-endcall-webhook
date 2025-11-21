@@ -6,16 +6,103 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Environment variables (must match Render keys)
+// Only need Zapier URL now
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
-// IMPORTANT: this now matches your Render env var: ABSTRACT_PHONE_API_KEY
-const ABSTRACT_API_KEY = process.env.ABSTRACT_PHONE_API_KEY;
 
 app.use(express.json());
 
 /**
+ * Try to derive a lead score + label from Vapi structured outputs.
+ * Looks for the "Success Evaluation" structured output and maps:
+ *  - engaged_and_reachable -> 70
+ *  - answered_not_fully_engaged -> 50
+ *  - invalid_or_unreachable/Invalid/unreachable -> 0
+ */
+function deriveLeadScore(structuredOutputs) {
+  if (!structuredOutputs) return {};
+
+  let label = null;
+  let score;
+  let rawResult = null;
+
+  for (const [id, so] of Object.entries(structuredOutputs)) {
+    if (!so || !so.name) continue;
+    const nameLower = String(so.name).toLowerCase();
+
+    if (nameLower.includes("success evaluation")) {
+      rawResult = so.result;
+
+      // Case 1: result is already an object like { label, score, reason }
+      if (rawResult && typeof rawResult === "object") {
+        if (rawResult.label) label = rawResult.label;
+        if (rawResult.score !== undefined) {
+          score = rawResult.score;
+          break;
+        }
+      }
+
+      // Case 2: result is a JSON string
+      if (typeof rawResult === "string") {
+        const trimmed = rawResult.trim();
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === "object") {
+            if (parsed.label) label = parsed.label;
+            if (parsed.score !== undefined) {
+              score = parsed.score;
+              break;
+            }
+          } else {
+            // Plain label string like "Invalid/unreachable"
+            label = trimmed;
+          }
+        } catch {
+          // Not JSON, treat as plain label string
+          label = trimmed;
+        }
+      }
+
+      // We found the "Success Evaluation" output; no need to keep looping
+      break;
+    }
+  }
+
+  if (!label && score === undefined) {
+    return {};
+  }
+
+  // If Vapi didn’t give a numeric score, derive it from the label
+  if (score === undefined && label) {
+    const norm = label.toLowerCase();
+
+    if (norm.includes("engaged_and_reachable") || norm.includes("engaged and reachable")) {
+      score = 70;
+    } else if (
+      norm.includes("answered_not_fully_engaged") ||
+      norm.includes("answered not fully engaged")
+    ) {
+      score = 50;
+    } else if (
+      norm.includes("invalid/unreachable") ||
+      norm.includes("invalid_or_unreachable")
+    ) {
+      score = 0;
+    } else {
+      // Fallback: unknown label, treat as 0 for safety
+      score = 0;
+    }
+  }
+
+  const result = {};
+  if (label) result.label = label;
+  if (score !== undefined) result.score = score;
+
+  return result;
+}
+
+/**
  * Normalize the Vapi webhook payload (handles both wrapped `message`
- * and potential direct payloads).
+ * and potential direct payloads). No enrichment, no null defaults.
  */
 function mapVapiEvent(body) {
   const msg = body.message || body || {};
@@ -34,8 +121,12 @@ function mapVapiEvent(body) {
     msg.structuredOutputs || msg.artifact?.structuredOutputs;
   const scorecards = msg.scorecards;
 
-  // Build objects ONLY with existing values
+  const cleaned = {
+    eventType,
+    rawEventType: eventType,
+  };
 
+  // ---- Call block ----
   const call = {};
   if (callObj.id) call.id = callObj.id;
   if (msg.startedAt || callObj.startedAt)
@@ -50,7 +141,9 @@ function mapVapiEvent(body) {
   if (msg.durationMs !== undefined) call.durationMs = msg.durationMs;
   if (msg.cost !== undefined) call.cost = msg.cost;
   else if (callObj.cost !== undefined) call.cost = callObj.cost;
+  if (Object.keys(call).length > 0) cleaned.call = call;
 
+  // ---- Customer block ----
   const customer = {};
   const number =
     customerObj.number ||
@@ -59,7 +152,9 @@ function mapVapiEvent(body) {
   if (number) customer.number = number;
   if (customerObj.name) customer.name = customerObj.name;
   if (customerObj.metadata) customer.metadata = customerObj.metadata;
+  if (Object.keys(customer).length > 0) cleaned.customer = customer;
 
+  // ---- Analysis block ----
   const analysis = {};
   if (analysisObj.summary || msg.summary)
     analysis.summary = analysisObj.summary || msg.summary;
@@ -72,91 +167,28 @@ function mapVapiEvent(body) {
         ? analysisObj.successEvaluation
         : msg.successEvaluation;
   }
-  if (analysisObj.score !== undefined) {
-    analysis.score = analysisObj.score;
+
+  // Derive lead score / label from structured outputs
+  const leadEval = deriveLeadScore(structuredOutputs);
+  if (leadEval.score !== undefined) {
+    analysis.score = leadEval.score;
+    cleaned.leadScore = leadEval.score;
+  }
+  if (leadEval.label) {
+    cleaned.leadLabel = leadEval.label;
   }
 
-  const cleaned = {
-    eventType,
-    call,
-    customer,
-    analysis,
-    rawEventType: eventType,
-  };
+  if (Object.keys(analysis).length > 0) cleaned.analysis = analysis;
 
-  if (structuredOutputs) {
-    cleaned.structuredOutputs = structuredOutputs;
-  }
-
+  // ---- Extras ----
+  if (structuredOutputs) cleaned.structuredOutputs = structuredOutputs;
   if (msg.transcript) cleaned.transcript = msg.transcript;
   if (msg.recordingUrl) cleaned.recordingUrl = msg.recordingUrl;
   if (msg.stereoRecordingUrl)
     cleaned.stereoRecordingUrl = msg.stereoRecordingUrl;
-
   if (scorecards) cleaned.scorecards = scorecards;
 
   return cleaned;
-}
-
-/**
- * Enrich a phone number using Abstract's Phone Validation API.
- * Returns an object with only real values, or undefined if it fails.
- */
-async function enrichPhone(phoneNumber) {
-  try {
-    if (!phoneNumber) {
-      console.warn("No phone number provided for enrichment.");
-      return;
-    }
-
-    if (!ABSTRACT_API_KEY) {
-      console.warn(
-        "ABSTRACT_PHONE_API_KEY is not set – skipping phone enrichment."
-      );
-      return;
-    }
-
-    const url = `https://phonevalidation.abstractapi.com/v1/?api_key=${ABSTRACT_API_KEY}&phone=${encodeURIComponent(
-      phoneNumber
-    )}`;
-
-    console.log("Calling Abstract API:", url.replace(ABSTRACT_API_KEY, "***"));
-
-    const resp = await fetch(url);
-    console.log(
-      "Abstract API response status:",
-      resp.status,
-      resp.statusText
-    );
-
-    if (!resp.ok) {
-      console.warn("Abstract API non-200 response body:", await resp.text());
-      return;
-    }
-
-    const data = await resp.json();
-    console.log("Abstract raw response:", JSON.stringify(data, null, 2));
-
-    const enrichment = {};
-
-    if (data.valid !== undefined) enrichment.valid = data.valid;
-    if (data.type) enrichment.lineType = data.type;
-    if (data.carrier) enrichment.carrier = data.carrier;
-    if (data.location) enrichment.location = data.location;
-    if (data.country && data.country.name) {
-      enrichment.countryName = data.country.name;
-    }
-
-    if (Object.keys(enrichment).length === 0) {
-      console.warn("Abstract API returned no usable enrichment data.");
-      return;
-    }
-
-    console.log("Abstract enrichment success:", enrichment);
-    return enrichment;
-  } catch (err) {
-    console.error("Error enriching phone via Abstract:", err);
-  }
 }
 
 // ---- Webhook route ----
@@ -165,22 +197,6 @@ app.post("/vapi-hook", async (req, res) => {
     console.log("Incoming Vapi event:", JSON.stringify(req.body, null, 2));
 
     const cleaned = mapVapiEvent(req.body);
-
-    // Enrich phone and attach the result if we get anything back
-    try {
-      const phoneNumber = cleaned.customer && cleaned.customer.number;
-      console.log("Phone number for enrichment:", phoneNumber);
-
-      const enrichment = await enrichPhone(phoneNumber);
-
-      if (enrichment) {
-        cleaned.phoneEnrichment = enrichment;
-      } else {
-        console.log("No phoneEnrichment attached (no data from Abstract).");
-      }
-    } catch (e) {
-      console.error("Unexpected error during enrichment:", e);
-    }
 
     console.log(
       "Forwarding cleaned payload to Zapier:",
@@ -198,7 +214,6 @@ app.post("/vapi-hook", async (req, res) => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(cleaned),
         });
-
         console.log(
           `Zapier response status: ${zapResp.status} ${zapResp.statusText}`
         );
@@ -207,8 +222,7 @@ app.post("/vapi-hook", async (req, res) => {
       }
     }
 
-    // Always acknowledge the webhook so Vapi doesn't retry
-    res.status(200).json({ ok: true });
+    res.status(200).json({ ok: true }); // Always acknowledge
   } catch (err) {
     console.error("Error in /vapi-hook handler:", err);
     res.status(500).json({ ok: false, error: "Server error" });
@@ -222,7 +236,5 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Middleware server running on port ${PORT}`);
-  console.log(
-    `ABSTRACT_PHONE_API_KEY present: ${!!ABSTRACT_API_KEY}, ZAPIER_HOOK_URL present: ${!!ZAPIER_HOOK_URL}`
-  );
+  console.log(`ZAPIER_HOOK_URL present: ${!!ZAPIER_HOOK_URL}`);
 });
