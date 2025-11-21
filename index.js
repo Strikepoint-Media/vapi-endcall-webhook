@@ -1,77 +1,106 @@
-// index.js  (ESM compatible)
+// index.js  (ESM)
 
 import express from "express";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Environment variables on Render
+// Set this in Render's environment variables
 const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
 
 app.use(express.json());
 
-// ---- Helper: map incoming Vapi event into a clean payload ----
+/**
+ * Normalize the Vapi webhook payload (handles both wrapped `message`
+ * and potential direct payloads).
+ */
 function mapVapiEvent(body) {
-  // Vapi usually sends `type`, but fall back just in case
-  const rawType =
-    body.type || body.eventType || body.event_type || "unknown";
+  // Vapi sends `{ message: { ... } }` to your server
+  const msg = body.message || body || {};
 
-  const call = body.call || {};
-  const customer = body.customer || body.caller || {};
+  const eventType = msg.type || body.type || "unknown";
 
-  const analysis = body.analysis || {};
-  const structuredOutputs = body.structuredOutputs || null;
+  // Core call object
+  const callObj = msg.call || msg.artifact?.call || {};
 
-  // If in future you re-add phone enrichment here, we’ll fill this in.
-  const phoneEnrichmentRaw = body.phoneEnrichment || {};
-  const phoneEnrichment = {
-    valid: phoneEnrichmentRaw.valid ?? null,
-    lineType: phoneEnrichmentRaw.lineType ?? null,
-    carrier: phoneEnrichmentRaw.carrier ?? null,
-    location: phoneEnrichmentRaw.location ?? null,
-    countryName: phoneEnrichmentRaw.countryName ?? null,
-  };
+  // Customer info (also present in variables/variableValues)
+  const customerObj =
+    msg.customer ||
+    msg.variables?.customer ||
+    msg.variableValues?.customer ||
+    {};
 
+  const analysisObj = msg.analysis || {};
+
+  // Structured outputs from your Call Summary + Success Evaluation templates
+  const structuredOutputs =
+    msg.structuredOutputs || msg.artifact?.structuredOutputs || null;
+
+  // Optional scorecards (future scoring, etc.)
+  const scorecards = msg.scorecards || null;
+
+  // Build a cleaned payload with the fields you actually care about
   return {
-    eventType: rawType,
+    // High-level event type from Vapi: "status-update", "end-of-call-report", etc.
+    eventType,
 
     call: {
-      id: call.id ?? null,
-      startedAt: call.startedAt ?? null,
-      endedAt: call.endedAt ?? null,
-      endedReason: call.endedReason ?? null,
-      durationSeconds: call.durationSeconds ?? null,
-      durationMinutes: call.durationMinutes ?? null,
-      durationMs: call.durationMs ?? null,
-      cost: call.cost ?? null,
+      id: callObj.id ?? null,
+      startedAt: msg.startedAt ?? callObj.startedAt ?? null,
+      endedAt: msg.endedAt ?? callObj.endedAt ?? null,
+      endedReason: msg.endedReason ?? null,
+      durationSeconds: msg.durationSeconds ?? null,
+      durationMinutes: msg.durationMinutes ?? null,
+      durationMs: msg.durationMs ?? null,
+      cost: msg.cost ?? callObj.cost ?? null,
     },
 
     customer: {
       number:
-        customer.number ||
-        customer.phone ||
-        customer.phoneNumber ||
+        customerObj.number ||
+        customerObj.phone ||
+        customerObj.phoneNumber ||
         null,
-      name: customer.name ?? null,
-      metadata: customer.metadata ?? null,
+      name: customerObj.name ?? null,
+      metadata: customerObj.metadata ?? null,
     },
 
-    phoneEnrichment,
+    // Placeholder for future phone-enrichment; currently not present in your payload
+    phoneEnrichment: {
+      valid: null,
+      lineType: null,
+      carrier: null,
+      location: null,
+      countryName: null,
+    },
 
     analysis: {
-      summary: analysis.summary ?? null,
-      successEvaluation: analysis.successEvaluation ?? null,
-      score: analysis.score ?? null,
+      // Vapi's analysis.summary (short text summary)
+      summary: analysisObj.summary ?? msg.summary ?? null,
+      // Vapi's boolean/string successEvaluation ("true"/"false")
+      successEvaluation:
+        analysisObj.successEvaluation ?? msg.successEvaluation ?? null,
+      // Numeric score if/when you add it (or leave null for now)
+      score: analysisObj.score ?? null,
     },
 
+    // Your custom structured outputs: Call Summary + Success Evaluation - Descriptive
     structuredOutputs,
 
-    // For debugging / filters
-    rawEventType: rawType,
+    // Transcript and recordings for debugging / QA
+    transcript: msg.transcript ?? null,
+    recordingUrl: msg.recordingUrl ?? null,
+    stereoRecordingUrl: msg.stereoRecordingUrl ?? null,
+
+    // Any scorecards Vapi generates (future use)
+    scorecards,
+
+    // Useful for Zapier filtering & debugging
+    rawEventType: eventType,
   };
 }
 
-// ---- Main webhook route ----
+// ---- Webhook route ----
 app.post("/vapi-hook", async (req, res) => {
   try {
     console.log("Incoming Vapi event:", JSON.stringify(req.body, null, 2));
@@ -103,7 +132,7 @@ app.post("/vapi-hook", async (req, res) => {
       }
     }
 
-    // Always acknowledge to Vapi so it doesn’t retry
+    // Always acknowledge the webhook so Vapi doesn't retry
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Error in /vapi-hook handler:", err);
@@ -116,7 +145,6 @@ app.get("/", (req, res) => {
   res.send("Vapi end-call webhook is running.");
 });
 
-// Start server
 app.listen(PORT, () => {
   console.log(`Middleware server running on port ${PORT}`);
 });
