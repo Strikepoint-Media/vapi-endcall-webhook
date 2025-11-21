@@ -11,12 +11,16 @@ const ZAPIER_HOOK_URL = process.env.ZAPIER_HOOK_URL;
 
 app.use(express.json());
 
+// In-memory buffer of call events, keyed by call.id
+// Shape: { msg: mergedMessage, timeoutId, flushed }
+const callBuffers = new Map();
+
 /**
  * Try to derive a lead score + label from Vapi structured outputs.
  * Looks for the "Success Evaluation" structured output and maps:
  *  - engaged_and_reachable -> 70
  *  - answered_not_fully_engaged -> 50
- *  - invalid_or_unreachable/Invalid/unreachable -> 0
+ *  - invalid_or_unreachable / Invalid/unreachable -> 0
  */
 function deriveLeadScore(structuredOutputs) {
   if (!structuredOutputs) return {};
@@ -32,7 +36,7 @@ function deriveLeadScore(structuredOutputs) {
     if (nameLower.includes("success evaluation")) {
       rawResult = so.result;
 
-      // Case 1: result is already an object like { label, score, reason }
+      // Case 1: object { label, score, reason }
       if (rawResult && typeof rawResult === "object") {
         if (rawResult.label) label = rawResult.label;
         if (rawResult.score !== undefined) {
@@ -41,7 +45,7 @@ function deriveLeadScore(structuredOutputs) {
         }
       }
 
-      // Case 2: result is a JSON string
+      // Case 2: JSON string or plain string
       if (typeof rawResult === "string") {
         const trimmed = rawResult.trim();
         try {
@@ -53,16 +57,14 @@ function deriveLeadScore(structuredOutputs) {
               break;
             }
           } else {
-            // Plain label string like "Invalid/unreachable"
             label = trimmed;
           }
         } catch {
-          // Not JSON, treat as plain label string
+          // Not JSON, treat as plain label
           label = trimmed;
         }
       }
 
-      // We found the "Success Evaluation" output; no need to keep looping
       break;
     }
   }
@@ -71,7 +73,7 @@ function deriveLeadScore(structuredOutputs) {
     return {};
   }
 
-  // If Vapi didn’t give a numeric score, derive it from the label
+  // If Vapi didn’t provide a numeric score, derive from label
   if (score === undefined && label) {
     const norm = label.toLowerCase();
 
@@ -88,7 +90,6 @@ function deriveLeadScore(structuredOutputs) {
     ) {
       score = 0;
     } else {
-      // Fallback: unknown label, treat as 0 for safety
       score = 0;
     }
   }
@@ -191,38 +192,150 @@ function mapVapiEvent(body) {
   return cleaned;
 }
 
+/**
+ * Shallow-deep merge of two Vapi `message` objects.
+ * - Skips null/undefined values
+ * - For plain objects, merges keys
+ * - For arrays/scalars, latest event wins
+ */
+function mergeMessages(existing = {}, incoming = {}) {
+  const merged = { ...existing };
+
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === null || value === undefined) continue;
+
+    // Merge nested objects (analysis, artifact, etc.)
+    if (
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      merged[key] = {
+        ...(merged[key] || {}),
+        ...value,
+      };
+    } else {
+      // Scalars & arrays: latest wins
+      merged[key] = value;
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Flush a buffered call (if not already flushed) to Zapier.
+ */
+async function flushCall(callId) {
+  const buffer = callBuffers.get(callId);
+  if (!buffer || buffer.flushed) return;
+
+  buffer.flushed = true;
+  if (buffer.timeoutId) {
+    clearTimeout(buffer.timeoutId);
+    buffer.timeoutId = null;
+  }
+
+  const wrappedBody = { message: buffer.msg };
+  const cleaned = mapVapiEvent(wrappedBody);
+
+  console.log(
+    `Flushing unified event for call ${callId}:`,
+    JSON.stringify(cleaned, null, 2)
+  );
+
+  if (!ZAPIER_HOOK_URL) {
+    console.warn(
+      "ZAPIER_HOOK_URL is not set – skipping forward to Zapier."
+    );
+  } else {
+    try {
+      const zapResp = await fetch(ZAPIER_HOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cleaned),
+      });
+      console.log(
+        `Zapier response status (flush): ${zapResp.status} ${zapResp.statusText}`
+      );
+    } catch (err) {
+      console.error("Error forwarding unified event to Zapier:", err);
+    }
+  }
+
+  callBuffers.delete(callId);
+}
+
 // ---- Webhook route ----
 app.post("/vapi-hook", async (req, res) => {
   try {
     console.log("Incoming Vapi event:", JSON.stringify(req.body, null, 2));
 
-    const cleaned = mapVapiEvent(req.body);
+    const rawMsg = req.body.message || req.body || {};
+    const callObj = rawMsg.call || rawMsg.artifact?.call || {};
+    const callId = callObj.id;
 
-    console.log(
-      "Forwarding cleaned payload to Zapier:",
-      JSON.stringify(cleaned, null, 2)
-    );
+    // If for some reason there is no callId, just treat as one-off
+    if (!callId) {
+      console.warn("No call.id on incoming event, forwarding as-is.");
+      const cleaned = mapVapiEvent(req.body);
 
-    if (!ZAPIER_HOOK_URL) {
-      console.warn(
-        "ZAPIER_HOOK_URL is not set – skipping forward to Zapier."
-      );
-    } else {
-      try {
-        const zapResp = await fetch(ZAPIER_HOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(cleaned),
-        });
-        console.log(
-          `Zapier response status: ${zapResp.status} ${zapResp.statusText}`
+      if (ZAPIER_HOOK_URL) {
+        try {
+          const zapResp = await fetch(ZAPIER_HOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(cleaned),
+          });
+          console.log(
+            `Zapier response status (no-call-id): ${zapResp.status} ${zapResp.statusText}`
+          );
+        } catch (err) {
+          console.error("Error forwarding to Zapier (no-call-id):", err);
+        }
+      } else {
+        console.warn(
+          "ZAPIER_HOOK_URL not set – can't forward no-call-id event."
         );
-      } catch (err) {
-        console.error("Error forwarding to Zapier:", err);
       }
+
+      res.status(200).json({ ok: true });
+      return;
     }
 
-    res.status(200).json({ ok: true }); // Always acknowledge
+    // Use / create buffer for this call
+    let buffer = callBuffers.get(callId);
+    if (!buffer) {
+      buffer = { msg: {}, timeoutId: null, flushed: false };
+      callBuffers.set(callId, buffer);
+    }
+
+    // Merge this event into the buffered message
+    buffer.msg = mergeMessages(buffer.msg, rawMsg);
+
+    // If we already scheduled a fallback, clear it so we can reschedule
+    if (buffer.timeoutId) {
+      clearTimeout(buffer.timeoutId);
+      buffer.timeoutId = null;
+    }
+
+    const isEndOfCallReport = rawMsg.type === "end-of-call-report";
+
+    if (isEndOfCallReport) {
+      // Final, authoritative event: flush immediately (single unified hit to Zapier)
+      await flushCall(callId);
+    } else {
+      // Not an end-of-call-report: schedule a fallback flush
+      // If an end-of-call-report arrives later, it will override this before the timer fires.
+      const FALLBACK_MS = 20000; // 20 seconds after last event
+      buffer.timeoutId = setTimeout(() => {
+        flushCall(callId).catch((err) =>
+          console.error("Error in delayed flush:", err)
+        );
+      }, FALLBACK_MS);
+    }
+
+    // Always ACK Vapi quickly so it doesn't retry
+    res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Error in /vapi-hook handler:", err);
     res.status(500).json({ ok: false, error: "Server error" });
